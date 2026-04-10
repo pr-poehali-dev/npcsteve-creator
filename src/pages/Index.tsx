@@ -8,6 +8,7 @@ const HERO_IMAGE = "https://cdn.poehali.dev/projects/1da53510-a90a-4c19-87dc-ee7
 const API = {
   generateImage: "https://functions.poehali.dev/bbac58dc-6753-4023-8a35-c179d54bc885",
   authYandex: "https://functions.poehali.dev/a12ba70f-2805-4f06-bf02-5ae6965e01fd",
+  authMagic: "https://functions.poehali.dev/efd7b664-1bf7-4be7-9dbe-522fb47c3416",
 };
 
 /* ─── USER CONTEXT ─── */
@@ -26,7 +27,7 @@ function useAuth() {
       .catch(() => setLoading(false));
   }, []);
 
-  // Handle OAuth callback code in URL
+  // Handle Yandex OAuth callback
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get('code');
@@ -37,6 +38,27 @@ function useAuth() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code, redirect_uri: redirectUri }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.session_token) {
+          localStorage.setItem('session_token', data.session_token);
+          setUser(data.user);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Handle Magic Link token in URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const magicToken = params.get('magic_token');
+    if (!magicToken) return;
+    window.history.replaceState({}, '', window.location.pathname);
+    fetch(`${API.authMagic}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: magicToken }),
     })
       .then(r => r.json())
       .then(data => {
@@ -100,46 +122,134 @@ function GridBackground() {
 }
 
 /* ─── AUTH MODAL ─── */
-function AuthModal({ onClose, clientId }: { onClose: () => void; clientId?: string }) {
+function AuthModal({ onClose }: { onClose: () => void }) {
+  const [email, setEmail] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState('');
+
   const redirectUri = window.location.origin + window.location.pathname;
-  const yandexUrl = `https://oauth.yandex.ru/authorize?response_type=code&client_id=${clientId || 'YOUR_CLIENT_ID'}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=login%3Ainfo%20login%3Aemail`;
+  const yandexUrl = `https://oauth.yandex.ru/authorize?response_type=code&client_id=YOUR_CLIENT_ID&redirect_uri=${encodeURIComponent(redirectUri)}&scope=login%3Ainfo%20login%3Aemail`;
+
+  async function sendMagicLink() {
+    if (!email.trim() || !email.includes('@')) {
+      setError('Введите корректный email');
+      return;
+    }
+    setSending(true);
+    setError('');
+    try {
+      const r = await fetch(`${API.authMagic}/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim().toLowerCase(), site_url: window.location.origin }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка отправки');
+      setSent(true);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Ошибка отправки');
+    } finally {
+      setSending(false);
+    }
+  }
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(12px)' }}
+    <div className="fixed inset-0 z-[100] flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(12px)' }}
       onClick={onClose}>
       <div className="w-full max-w-sm mx-4 p-8 rounded-2xl relative animate-scale-in"
         style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}
         onClick={e => e.stopPropagation()}>
+
         <button onClick={onClose} className="absolute top-4 right-4 text-muted-foreground hover:text-white transition-colors">
           <Icon name="X" size={18} />
         </button>
 
-        <div className="text-center mb-8">
+        <div className="text-center mb-7">
           <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4"
             style={{ background: 'linear-gradient(135deg, rgba(0,245,255,0.15), rgba(178,75,255,0.15))', border: '1px solid rgba(0,245,255,0.2)' }}>
             <Icon name="Sparkles" size={28} className="text-neon-cyan" />
           </div>
           <h2 className="font-display text-2xl font-bold uppercase tracking-wider text-white">Войти в LUMIX AI</h2>
-          <p className="font-body text-sm text-muted-foreground mt-2">Одна кнопка — полный доступ к студии</p>
+          <p className="font-body text-sm text-muted-foreground mt-2">Без пароля — просто email</p>
         </div>
 
-        <a href={yandexUrl}
-          className="flex items-center justify-center gap-3 w-full py-3.5 rounded-xl font-body font-semibold text-white transition-all hover:scale-[1.02] hover:shadow-lg"
-          style={{ background: 'linear-gradient(135deg, #fc3f1d, #e6001b)' }}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
-            <path d="M13.4 12.4L8.6 4H11.4L14.8 10.4L18 4H20.8L16 12.4L21.4 22H18.6L14.6 14.8L10.4 22H7.6L13.4 12.4ZM5.8 4H3V22H5.8V4Z"/>
-          </svg>
-          Войти через Яндекс ID
-        </a>
+        {sent ? (
+          /* ── Успешно отправлено ── */
+          <div className="text-center py-4 animate-fade-in">
+            <div className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
+              style={{ background: 'rgba(0,245,255,0.1)', border: '1px solid rgba(0,245,255,0.3)' }}>
+              <Icon name="Mail" size={26} className="text-neon-cyan" />
+            </div>
+            <p className="font-body font-semibold text-white mb-2">Письмо отправлено!</p>
+            <p className="font-body text-sm text-muted-foreground leading-relaxed">
+              Проверьте <span className="text-white">{email}</span> — там ссылка для входа. Действует 15 минут.
+            </p>
+            <button onClick={() => { setSent(false); setEmail(''); }}
+              className="mt-5 text-xs font-body text-muted-foreground hover:text-white transition-colors underline underline-offset-2">
+              Отправить на другой email
+            </button>
+          </div>
+        ) : (
+          /* ── Форма ── */
+          <div className="space-y-3">
+            <div className="relative">
+              <Icon name="Mail" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="email"
+                value={email}
+                onChange={e => { setEmail(e.target.value); setError(''); }}
+                onKeyDown={e => e.key === 'Enter' && sendMagicLink()}
+                placeholder="your@email.com"
+                className="w-full pl-10 pr-4 py-3 rounded-xl font-body text-sm outline-none transition-all placeholder:text-muted-foreground"
+                style={{ background: 'rgba(255,255,255,0.04)', border: `1px solid ${error ? 'rgba(255,45,155,0.5)' : 'var(--dark-border)'}`, color: 'white' }}
+                autoFocus
+              />
+            </div>
 
-        <div className="mt-4 flex items-center gap-2">
-          <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
-          <span className="text-xs font-body text-muted-foreground">безопасно</span>
-          <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
-        </div>
+            {error && (
+              <p className="text-xs font-body text-neon-pink flex items-center gap-1">
+                <Icon name="AlertCircle" size={12} />
+                {error}
+              </p>
+            )}
 
-        <p className="text-center text-xs font-body text-muted-foreground mt-4">
-          Регистрируясь, вы принимаете условия использования сервиса
+            <button onClick={sendMagicLink} disabled={sending}
+              className="w-full py-3.5 rounded-xl font-body font-semibold transition-all hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
+              {sending ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="w-4 h-4 rounded-full border-2 border-black border-t-transparent animate-spin" />
+                  Отправляю...
+                </span>
+              ) : (
+                <span className="flex items-center justify-center gap-2">
+                  <Icon name="Send" size={16} />
+                  Отправить ссылку
+                </span>
+              )}
+            </button>
+
+            <div className="flex items-center gap-3 my-1">
+              <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
+              <span className="text-xs font-body text-muted-foreground">или</span>
+              <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
+            </div>
+
+            <a href={yandexUrl}
+              className="flex items-center justify-center gap-3 w-full py-3 rounded-xl font-body font-semibold text-white transition-all hover:scale-[1.02]"
+              style={{ background: 'rgba(252,63,29,0.15)', border: '1px solid rgba(252,63,29,0.3)' }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="#fc3f1d">
+                <path d="M13.4 12.4L8.6 4H11.4L14.8 10.4L18 4H20.8L16 12.4L21.4 22H18.6L14.6 14.8L10.4 22H7.6L13.4 12.4ZM5.8 4H3V22H5.8V4Z"/>
+              </svg>
+              <span style={{ color: '#fc3f1d' }}>Войти через Яндекс ID</span>
+            </a>
+          </div>
+        )}
+
+        <p className="text-center text-xs font-body text-muted-foreground mt-5">
+          Регистрируясь, вы принимаете условия использования
         </p>
       </div>
     </div>
