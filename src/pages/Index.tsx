@@ -21,7 +21,11 @@ function useAuth() {
   useEffect(() => {
     const token = localStorage.getItem('session_token');
     if (!token) { setLoading(false); return; }
-    fetch(`${API.authYandex}/me`, { headers: { 'X-Session-Token': token } })
+    fetch(API.authMagic, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+      body: JSON.stringify({ action: 'me', session_token: token }),
+    })
       .then(r => r.ok ? r.json() : null)
       .then(u => { setUser(u); setLoading(false); })
       .catch(() => setLoading(false));
@@ -55,10 +59,10 @@ function useAuth() {
     const magicToken = params.get('magic_token');
     if (!magicToken) return;
     window.history.replaceState({}, '', window.location.pathname);
-    fetch(`${API.authMagic}/verify`, {
+    fetch(API.authMagic, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: magicToken }),
+      body: JSON.stringify({ action: 'verify', token: magicToken }),
     })
       .then(r => r.json())
       .then(data => {
@@ -139,10 +143,10 @@ function AuthModal({ onClose }: { onClose: () => void }) {
     setSending(true);
     setError('');
     try {
-      const r = await fetch(`${API.authMagic}/send`, {
+      const r = await fetch(API.authMagic, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim().toLowerCase(), site_url: window.location.origin }),
+        body: JSON.stringify({ action: 'send', email: email.trim().toLowerCase(), site_url: window.location.origin }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'Ошибка отправки');
@@ -958,10 +962,24 @@ function BillingSection() {
                 ))}
               </div>
 
-              <button className="w-full py-3 rounded-xl font-display font-bold uppercase tracking-wider text-sm transition-all hover:scale-105"
-                style={isSelected ? { background: colorMap[plan.color], color: 'black' } : { background: 'var(--dark-border)', color: 'white' }}>
-                {isSelected ? "Подключить" : "Выбрать"}
-              </button>
+              {isSelected ? (
+                <a
+                  href={`https://t.me/NPCsteve?text=${encodeURIComponent(`Хочу подключить тариф "${plan.name}" — ${price}₽/${plan.period}`)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 w-full py-3 rounded-xl font-display font-bold uppercase tracking-wider text-sm transition-all hover:scale-105 text-black"
+                  style={{ background: colorMap[plan.color] }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L7.525 13.46l-2.96-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.623.099z"/>
+                  </svg>
+                  Оплатить в Telegram
+                </a>
+              ) : (
+                <button className="w-full py-3 rounded-xl font-display font-bold uppercase tracking-wider text-sm transition-all hover:scale-105"
+                  style={{ background: 'var(--dark-border)', color: 'white' }}>
+                  Выбрать
+                </button>
+              )}
             </div>
           );
         })}

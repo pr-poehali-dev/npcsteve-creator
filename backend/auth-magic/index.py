@@ -1,8 +1,8 @@
 """
 Magic Link авторизация: отправка ссылки на email и верификация токена.
-POST /send   — отправляет magic link на email
-POST /verify — проверяет токен, создаёт сессию и возвращает пользователя
-GET  /me     — возвращает текущего пользователя по session_token
+POST (body.action=send)   — отправляет magic link на email
+POST (body.action=verify) — проверяет токен, создаёт сессию
+POST (body.action=me)     — возвращает пользователя по session_token
 """
 import json
 import os
@@ -32,22 +32,18 @@ def send_magic_link_email(to_email: str, magic_url: str) -> None:
         <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0d0d1a;color:#fff;border-radius:16px;overflow:hidden">
           <div style="background:linear-gradient(135deg,#00f5ff,#b24bff);padding:2px">
             <div style="background:#0d0d1a;padding:40px 32px">
-              <div style="font-size:24px;font-weight:bold;letter-spacing:4px;margin-bottom:8px">LUMIX<span style="background:linear-gradient(135deg,#00f5ff,#b24bff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">AI</span></div>
+              <div style="font-size:24px;font-weight:bold;letter-spacing:4px;margin-bottom:8px">LUMIX AI</div>
               <p style="color:#888;margin:0 0 32px">Ваша ссылка для входа</p>
-
               <p style="color:#ccc;line-height:1.6;margin:0 0 24px">
-                Нажмите кнопку ниже, чтобы войти в LUMIX AI.<br>
+                Нажмите кнопку ниже, чтобы войти.<br>
                 Ссылка действует <strong style="color:#fff">15 минут</strong>.
               </p>
-
               <a href="{magic_url}"
                 style="display:inline-block;background:linear-gradient(135deg,#00f5ff,#b24bff);color:#000;font-weight:bold;text-decoration:none;padding:14px 32px;border-radius:12px;font-size:15px;letter-spacing:1px">
                 Войти в LUMIX AI →
               </a>
-
               <p style="color:#555;font-size:12px;margin:32px 0 0;line-height:1.6">
-                Если вы не запрашивали вход — просто проигнорируйте это письмо.<br>
-                Ссылка одноразовая и автоматически истечёт.
+                Если вы не запрашивали вход — просто проигнорируйте это письмо.
               </p>
             </div>
           </div>
@@ -88,21 +84,13 @@ def upsert_user_by_email(conn, email: str) -> dict:
 def create_session(conn, user_id: int) -> str:
     token = str(uuid.uuid4())
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-          token VARCHAR(64) PRIMARY KEY,
-          user_id INTEGER NOT NULL,
-          created_at TIMESTAMPTZ DEFAULT NOW(),
-          expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days'
-        )
-    """)
     cur.execute("INSERT INTO sessions (token, user_id) VALUES (%s, %s)", (token, user_id))
     conn.commit()
     cur.close()
     return token
 
 
-def get_user_by_session(conn, token: str) -> dict | None:
+def get_user_by_session(conn, token: str):
     cur = conn.cursor()
     cur.execute("""
         SELECT u.id, u.email, u.name, u.avatar_url
@@ -120,12 +108,17 @@ def handler(event: dict, context) -> dict:
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
 
-    path = event.get('path', '/')
-    method = event.get('httpMethod', 'GET')
+    # Все запросы — POST, action передаётся в теле
+    try:
+        body = json.loads(event.get('body') or '{}')
+    except Exception:
+        return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Invalid JSON'})}
 
-    # GET /me
-    if method == 'GET':
-        token = (event.get('headers') or {}).get('X-Session-Token', '')
+    action = body.get('action', '')
+
+    # action=me — получить текущего пользователя
+    if action == 'me':
+        token = (event.get('headers') or {}).get('X-Session-Token', '') or body.get('session_token', '')
         if not token:
             return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Нет токена'})}
         conn = get_db()
@@ -135,16 +128,8 @@ def handler(event: dict, context) -> dict:
             return {'statusCode': 401, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Сессия истекла'})}
         return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps(user)}
 
-    if method != 'POST':
-        return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Not found'})}
-
-    try:
-        body = json.loads(event.get('body') or '{}')
-    except Exception:
-        return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Invalid JSON'})}
-
-    # POST /send — отправить magic link
-    if '/send' in path:
+    # action=send — отправить magic link
+    if action == 'send':
         email = (body.get('email') or '').strip().lower()
         if not email or '@' not in email:
             return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Укажите корректный email'})}
@@ -154,12 +139,11 @@ def handler(event: dict, context) -> dict:
 
         conn = get_db()
         cur = conn.cursor()
-        # Удаляем старые неиспользованные токены для этого email
-        cur.execute("UPDATE magic_links SET used = TRUE WHERE email = %s AND used = FALSE AND expires_at > NOW()", (email,))
         cur.execute(
-            "INSERT INTO magic_links (email, token) VALUES (%s, %s)",
-            (email, token)
+            "UPDATE magic_links SET used = TRUE WHERE email = %s AND used = FALSE",
+            (email,)
         )
+        cur.execute("INSERT INTO magic_links (email, token) VALUES (%s, %s)", (email, token))
         conn.commit()
         cur.close()
         conn.close()
@@ -167,10 +151,10 @@ def handler(event: dict, context) -> dict:
         magic_url = f"{site_url}?magic_token={token}"
         send_magic_link_email(email, magic_url)
 
-        return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True, 'message': 'Письмо отправлено'})}
+        return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
 
-    # POST /verify — проверить токен
-    if '/verify' in path:
+    # action=verify — верифицировать токен
+    if action == 'verify':
         token = (body.get('token') or '').strip()
         if not token:
             return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Токен обязателен'})}
@@ -199,4 +183,4 @@ def handler(event: dict, context) -> dict:
 
         return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'session_token': session_token, 'user': user})}
 
-    return {'statusCode': 404, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Not found'})}
+    return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Укажите action: send, verify или me'})}
