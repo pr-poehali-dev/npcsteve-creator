@@ -1,9 +1,60 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import Icon from "@/components/ui/icon";
 
 type Section = "studio" | "editor" | "gallery" | "billing";
 
 const HERO_IMAGE = "https://cdn.poehali.dev/projects/1da53510-a90a-4c19-87dc-ee717d9f851a/files/90016d74-ebc6-4d0f-bdfb-14671d849e86.jpg";
+
+const API = {
+  generateImage: "https://functions.poehali.dev/bbac58dc-6753-4023-8a35-c179d54bc885",
+  authYandex: "https://functions.poehali.dev/a12ba70f-2805-4f06-bf02-5ae6965e01fd",
+};
+
+/* ─── USER CONTEXT ─── */
+type User = { id: number; name: string; email: string; avatar_url: string | null };
+
+function useAuth() {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem('session_token');
+    if (!token) { setLoading(false); return; }
+    fetch(`${API.authYandex}/me`, { headers: { 'X-Session-Token': token } })
+      .then(r => r.ok ? r.json() : null)
+      .then(u => { setUser(u); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
+
+  // Handle OAuth callback code in URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    if (!code) return;
+    const redirectUri = window.location.origin + window.location.pathname;
+    window.history.replaceState({}, '', window.location.pathname);
+    fetch(API.authYandex, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, redirect_uri: redirectUri }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.session_token) {
+          localStorage.setItem('session_token', data.session_token);
+          setUser(data.user);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('session_token');
+    setUser(null);
+  }, []);
+
+  return { user, loading, setUser, logout };
+}
 
 /* ─── MOCK DATA ─── */
 const galleryItems = [
@@ -48,9 +99,65 @@ function GridBackground() {
   );
 }
 
+/* ─── AUTH MODAL ─── */
+function AuthModal({ onClose, clientId }: { onClose: () => void; clientId?: string }) {
+  const redirectUri = window.location.origin + window.location.pathname;
+  const yandexUrl = `https://oauth.yandex.ru/authorize?response_type=code&client_id=${clientId || 'YOUR_CLIENT_ID'}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=login%3Ainfo%20login%3Aemail`;
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center" style={{ background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(12px)' }}
+      onClick={onClose}>
+      <div className="w-full max-w-sm mx-4 p-8 rounded-2xl relative animate-scale-in"
+        style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}
+        onClick={e => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-4 right-4 text-muted-foreground hover:text-white transition-colors">
+          <Icon name="X" size={18} />
+        </button>
+
+        <div className="text-center mb-8">
+          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4"
+            style={{ background: 'linear-gradient(135deg, rgba(0,245,255,0.15), rgba(178,75,255,0.15))', border: '1px solid rgba(0,245,255,0.2)' }}>
+            <Icon name="Sparkles" size={28} className="text-neon-cyan" />
+          </div>
+          <h2 className="font-display text-2xl font-bold uppercase tracking-wider text-white">Войти в LUMIX AI</h2>
+          <p className="font-body text-sm text-muted-foreground mt-2">Одна кнопка — полный доступ к студии</p>
+        </div>
+
+        <a href={yandexUrl}
+          className="flex items-center justify-center gap-3 w-full py-3.5 rounded-xl font-body font-semibold text-white transition-all hover:scale-[1.02] hover:shadow-lg"
+          style={{ background: 'linear-gradient(135deg, #fc3f1d, #e6001b)' }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
+            <path d="M13.4 12.4L8.6 4H11.4L14.8 10.4L18 4H20.8L16 12.4L21.4 22H18.6L14.6 14.8L10.4 22H7.6L13.4 12.4ZM5.8 4H3V22H5.8V4Z"/>
+          </svg>
+          Войти через Яндекс ID
+        </a>
+
+        <div className="mt-4 flex items-center gap-2">
+          <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
+          <span className="text-xs font-body text-muted-foreground">безопасно</span>
+          <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
+        </div>
+
+        <p className="text-center text-xs font-body text-muted-foreground mt-4">
+          Регистрируясь, вы принимаете условия использования сервиса
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /* ─── NAVBAR ─── */
-function Navbar({ active, setActive }: { active: Section; setActive: (s: Section) => void }) {
+function Navbar({
+  active, setActive, user, onLoginClick, onLogout
+}: {
+  active: Section;
+  setActive: (s: Section) => void;
+  user: User | null;
+  onLoginClick: () => void;
+  onLogout: () => void;
+}) {
   const [scrolled, setScrolled] = useState(false);
+  const [userMenu, setUserMenu] = useState(false);
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 40);
@@ -82,10 +189,43 @@ function Navbar({ active, setActive }: { active: Section; setActive: (s: Section
           })}
         </div>
 
-        <button className="px-4 py-2 rounded-lg text-sm font-body font-semibold text-black transition-all hover:scale-105"
-          style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
-          Войти
-        </button>
+        {user ? (
+          <div className="relative">
+            <button onClick={() => setUserMenu(v => !v)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all hover:scale-105"
+              style={{ background: 'rgba(30,30,46,0.8)', border: '1px solid var(--dark-border)' }}>
+              {user.avatar_url
+                ? <img src={user.avatar_url} alt={user.name} className="w-6 h-6 rounded-full object-cover" />
+                : <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-black"
+                    style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
+                    {user.name?.[0] || '?'}
+                  </div>
+              }
+              <span className="text-sm font-body text-white hidden sm:block">{user.name?.split(' ')[0]}</span>
+              <Icon name="ChevronDown" size={14} className="text-muted-foreground" />
+            </button>
+            {userMenu && (
+              <div className="absolute right-0 top-full mt-2 w-48 rounded-xl overflow-hidden shadow-2xl z-50 animate-scale-in"
+                style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+                <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--dark-border)' }}>
+                  <p className="font-body font-semibold text-white text-sm">{user.name}</p>
+                  <p className="font-body text-xs text-muted-foreground truncate">{user.email}</p>
+                </div>
+                <button onClick={() => { onLogout(); setUserMenu(false); }}
+                  className="w-full flex items-center gap-2 px-4 py-3 text-sm font-body text-muted-foreground hover:text-white hover:bg-white/5 transition-colors">
+                  <Icon name="LogOut" size={14} />
+                  Выйти
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <button onClick={onLoginClick}
+            className="px-4 py-2 rounded-lg text-sm font-body font-semibold text-black transition-all hover:scale-105"
+            style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
+            Войти
+          </button>
+        )}
       </div>
     </nav>
   );
@@ -109,20 +249,174 @@ function Ticker() {
   );
 }
 
+/* ─── TEXT-TO-IMAGE BLOCK ─── */
+type GenResult = { id?: number; image_url: string; prompt: string };
+
+function TextToImage({ user, onLoginRequired }: { user: User | null; onLoginRequired: () => void }) {
+  const [prompt, setPrompt] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<GenResult | null>(null);
+  const [error, setError] = useState("");
+  const [imgSize, setImgSize] = useState("square_hd");
+
+  const sizes = [
+    { id: "square_hd", label: "1:1 HD" },
+    { id: "landscape_4_3", label: "4:3" },
+    { id: "portrait_4_3", label: "3:4" },
+  ];
+
+  const suggestions = [
+    "Портрет девушки в стиле киберпанк, неоновые огни",
+    "Футуристический город на закате, 8K фото",
+    "Минималистичный логотип на тёмном фоне",
+    "Космический пейзаж с планетами и туманностями",
+  ];
+
+  async function generate() {
+    if (!prompt.trim()) return;
+    if (!user) { onLoginRequired(); return; }
+    setLoading(true);
+    setError("");
+    setResult(null);
+    try {
+      const r = await fetch(API.generateImage, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          image_size: imgSize,
+          user_id: user?.id,
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка генерации');
+      setResult(data);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Ошибка');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="rounded-2xl overflow-hidden" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+      {/* Header */}
+      <div className="px-6 py-4 flex items-center gap-3 border-b" style={{ borderColor: 'var(--dark-border)' }}>
+        <div className="w-8 h-8 rounded-lg flex items-center justify-center"
+          style={{ background: 'rgba(0,245,255,0.1)', border: '1px solid rgba(0,245,255,0.2)' }}>
+          <Icon name="Wand2" size={16} className="text-neon-cyan" />
+        </div>
+        <div>
+          <p className="font-display font-bold text-sm uppercase tracking-wider text-white">Text → Image</p>
+          <p className="font-body text-xs text-muted-foreground">FLUX Schnell — до 4 секунд</p>
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-neon-cyan animate-pulse-glow" />
+          <span className="text-xs font-body text-neon-cyan">Live</span>
+        </div>
+      </div>
+
+      <div className="p-6 space-y-4">
+        {/* Size selector */}
+        <div className="flex gap-2">
+          {sizes.map(s => (
+            <button key={s.id} onClick={() => setImgSize(s.id)}
+              className="px-3 py-1.5 rounded-lg text-xs font-body font-medium transition-all"
+              style={imgSize === s.id
+                ? { background: 'rgba(0,245,255,0.15)', border: '1px solid rgba(0,245,255,0.4)', color: '#00f5ff' }
+                : { background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: '#888' }
+              }>
+              {s.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Prompt area */}
+        <div className="relative">
+          <textarea
+            value={prompt}
+            onChange={e => setPrompt(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) generate(); }}
+            placeholder="Опишите изображение на любом языке..."
+            rows={3}
+            className="w-full px-4 py-3 rounded-xl font-body text-sm placeholder:text-muted-foreground resize-none outline-none transition-all"
+            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--dark-border)', color: 'white' }}
+          />
+          <span className="absolute bottom-3 right-3 text-xs font-body text-muted-foreground">Ctrl+Enter</span>
+        </div>
+
+        {/* Quick suggestions */}
+        <div className="flex flex-wrap gap-2">
+          {suggestions.map((s, i) => (
+            <button key={i} onClick={() => setPrompt(s)}
+              className="text-xs font-body px-2.5 py-1 rounded-lg transition-all hover:scale-105 text-left"
+              style={{ background: 'rgba(178,75,255,0.06)', border: '1px solid rgba(178,75,255,0.15)', color: '#b24bff' }}>
+              {s.length > 30 ? s.slice(0, 30) + '…' : s}
+            </button>
+          ))}
+        </div>
+
+        {/* Generate button */}
+        <button onClick={generate} disabled={loading || !prompt.trim()}
+          className="w-full py-3 rounded-xl font-display font-bold uppercase tracking-widest text-sm transition-all hover:scale-[1.02] disabled:opacity-40 disabled:cursor-not-allowed"
+          style={{ background: loading || !prompt.trim() ? 'var(--dark-border)' : 'linear-gradient(135deg, #00f5ff, #b24bff)', color: loading || !prompt.trim() ? '#555' : 'black' }}>
+          {loading ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="w-4 h-4 rounded-full border-2 border-current border-t-transparent animate-spin inline-block" />
+              Генерирую...
+            </span>
+          ) : user ? "Сгенерировать изображение" : "Войдите чтобы генерировать"}
+        </button>
+
+        {/* Error */}
+        {error && (
+          <div className="p-3 rounded-xl flex items-center gap-2 animate-fade-in"
+            style={{ background: 'rgba(255,45,155,0.08)', border: '1px solid rgba(255,45,155,0.2)' }}>
+            <Icon name="AlertCircle" size={14} className="text-neon-pink flex-shrink-0" />
+            <span className="text-xs font-body text-neon-pink">{error}</span>
+          </div>
+        )}
+
+        {/* Result */}
+        {result && (
+          <div className="space-y-3 animate-fade-in">
+            <div className="relative rounded-xl overflow-hidden group">
+              <img src={result.image_url} alt={result.prompt}
+                className="w-full object-cover rounded-xl"
+                style={{ maxHeight: 480 }} />
+              <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-all duration-300 flex items-end"
+                style={{ background: 'linear-gradient(transparent, rgba(0,0,0,0.8))' }}>
+                <div className="p-4 w-full flex items-end justify-between">
+                  <p className="font-body text-xs text-white/80 flex-1 line-clamp-2">{result.prompt}</p>
+                  <a href={result.image_url} download target="_blank" rel="noopener noreferrer"
+                    className="ml-3 w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 transition-all hover:scale-110"
+                    style={{ background: 'rgba(0,245,255,0.2)', border: '1px solid rgba(0,245,255,0.4)' }}>
+                    <Icon name="Download" size={16} className="text-neon-cyan" />
+                  </a>
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-body text-muted-foreground">Готово! Наведи на изображение для скачивания</span>
+              <button onClick={() => setResult(null)}
+                className="text-xs font-body text-muted-foreground hover:text-white transition-colors flex items-center gap-1">
+                <Icon name="RefreshCw" size={12} />
+                Новое
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ─── STUDIO SECTION ─── */
-function StudioSection() {
+function StudioSection({ user, onLoginRequired }: { user: User | null; onLoginRequired: () => void }) {
   const [files, setFiles] = useState<string[]>([]);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [prompt, setPrompt] = useState("");
-  const [mode, setMode] = useState<"image" | "video" | "text">("image");
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const modes = [
-    { id: "image" as const, label: "Фото", icon: "Image" },
-    { id: "video" as const, label: "Видео", icon: "Film" },
-    { id: "text" as const, label: "Текст", icon: "FileText" },
-  ];
 
   const mockFiles = [
     "photo_001.jpg", "photo_002.jpg", "video_001.mp4",
@@ -130,20 +424,14 @@ function StudioSection() {
     "photo_005.jpg", "text_brief.txt",
   ];
 
-  function handleDrop() {
-    setFiles(mockFiles);
-  }
+  function handleDrop() { setFiles(mockFiles); }
 
   function handleProcess() {
     setProcessing(true);
     setProgress(0);
     intervalRef.current = setInterval(() => {
       setProgress(p => {
-        if (p >= 100) {
-          clearInterval(intervalRef.current!);
-          setProcessing(false);
-          return 100;
-        }
+        if (p >= 100) { clearInterval(intervalRef.current!); setProcessing(false); return 100; }
         return p + Math.random() * 8;
       });
     }, 150);
@@ -152,52 +440,37 @@ function StudioSection() {
   return (
     <div className="space-y-8 animate-fade-in">
       {/* Hero */}
-      <div className="relative rounded-2xl overflow-hidden" style={{ minHeight: 320 }}>
+      <div className="relative rounded-2xl overflow-hidden" style={{ minHeight: 280 }}>
         <img src={HERO_IMAGE} alt="AI Studio" className="absolute inset-0 w-full h-full object-cover opacity-30" />
         <div className="absolute inset-0" style={{ background: 'linear-gradient(135deg, rgba(0,245,255,0.1) 0%, rgba(178,75,255,0.1) 100%)' }} />
-        <div className="relative z-10 p-8 md:p-12 flex flex-col justify-end h-full" style={{ minHeight: 320 }}>
+        <div className="relative z-10 p-8 md:p-12 flex flex-col justify-end h-full" style={{ minHeight: 280 }}>
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-body mb-4 w-fit"
             style={{ background: 'rgba(0,245,255,0.1)', border: '1px solid rgba(0,245,255,0.3)', color: '#00f5ff' }}>
             <span className="w-1.5 h-1.5 rounded-full bg-neon-cyan animate-pulse-glow" />
             ИИ онлайн — обрабатывает запросы
           </div>
           <h1 className="font-display text-4xl md:text-6xl font-bold uppercase text-white leading-tight mb-3">
-            Создавай<br />
-            <span className="gradient-text">без границ</span>
+            Создавай<br /><span className="gradient-text">без границ</span>
           </h1>
           <p className="font-body text-muted-foreground text-lg max-w-lg">
-            Массовая генерация фото, видео и текста одновременно. Загрузи тысячи файлов — обработай за секунды.
+            Генерация фото, видео и текста. Массовая обработка файлов за секунды.
           </p>
         </div>
       </div>
 
-      {/* Mode tabs */}
-      <div className="grid grid-cols-3 gap-3">
-        {modes.map((m) => (
-          <button key={m.id} onClick={() => setMode(m.id)}
-            className={`p-4 rounded-xl flex flex-col items-center gap-2 transition-all duration-300 ${mode === m.id ? "glow-cyan" : "hover:scale-105"}`}
-            style={{ background: mode === m.id ? 'rgba(0,245,255,0.08)' : 'var(--dark-card)', border: mode === m.id ? '1px solid rgba(0,245,255,0.4)' : '1px solid var(--dark-border)' }}>
-            <Icon name={m.icon} size={24} className={mode === m.id ? "text-neon-cyan" : "text-muted-foreground"} />
-            <span className={`font-display text-sm font-medium uppercase tracking-wider ${mode === m.id ? "text-neon-cyan" : "text-muted-foreground"}`}>{m.label}</span>
-          </button>
-        ))}
-      </div>
+      {/* ── TEXT TO IMAGE ── */}
+      <TextToImage user={user} onLoginRequired={onLoginRequired} />
 
-      {/* Prompt */}
-      <div className="space-y-3">
-        <textarea
-          value={prompt}
-          onChange={e => setPrompt(e.target.value)}
-          placeholder="Опишите что нужно создать... Например: портрет в стиле киберпанк, неоновые огни ночного города"
-          rows={3}
-          className="w-full px-4 py-3 rounded-xl font-body text-sm placeholder:text-muted-foreground resize-none outline-none transition-all focus:border-neon-cyan/50"
-          style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)', color: 'white' }}
-        />
+      {/* Divider */}
+      <div className="flex items-center gap-4">
+        <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
+        <span className="font-display text-xs uppercase tracking-widest text-muted-foreground">Массовая обработка</span>
+        <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
       </div>
 
       {/* Dropzone */}
       <div onClick={handleDrop}
-        className="rounded-xl p-8 text-center cursor-pointer transition-all duration-300 hover:scale-[1.01] hover:border-neon-cyan/40"
+        className="rounded-xl p-8 text-center cursor-pointer transition-all duration-300 hover:scale-[1.01]"
         style={{ border: '2px dashed var(--dark-border)', background: 'var(--dark-card)' }}>
         {files.length === 0 ? (
           <div className="flex flex-col items-center gap-3">
@@ -207,7 +480,7 @@ function StudioSection() {
             </div>
             <div>
               <p className="font-body font-semibold text-white">Перетащите файлы сюда</p>
-              <p className="font-body text-sm text-muted-foreground mt-1">или нажмите для выбора — поддержка <span className="text-neon-cyan">массовой загрузки</span></p>
+              <p className="font-body text-sm text-muted-foreground mt-1">поддержка <span className="text-neon-cyan">массовой загрузки</span></p>
             </div>
             <span className="text-xs font-body text-muted-foreground px-3 py-1 rounded-full" style={{ background: 'rgba(255,255,255,0.04)' }}>
               JPG, PNG, MP4, MOV, TXT — до 10 000 файлов
@@ -216,8 +489,8 @@ function StudioSection() {
         ) : (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <span className="font-display font-semibold text-white uppercase tracking-wider">{files.length} файлов загружено</span>
-              <button onClick={(e) => { e.stopPropagation(); setFiles([]); }} className="text-muted-foreground hover:text-white transition-colors">
+              <span className="font-display font-semibold text-white uppercase tracking-wider">{files.length} файлов</span>
+              <button onClick={e => { e.stopPropagation(); setFiles([]); }} className="text-muted-foreground hover:text-white transition-colors">
                 <Icon name="X" size={16} />
               </button>
             </div>
@@ -233,11 +506,10 @@ function StudioSection() {
         )}
       </div>
 
-      {/* Progress */}
       {processing && (
         <div className="space-y-2">
           <div className="flex justify-between text-sm font-body">
-            <span className="text-neon-cyan">Генерация...</span>
+            <span className="text-neon-cyan">Обрабатываю...</span>
             <span className="text-white font-semibold">{Math.min(Math.round(progress), 100)}%</span>
           </div>
           <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--dark-border)' }}>
@@ -247,7 +519,6 @@ function StudioSection() {
         </div>
       )}
 
-      {/* Stats row */}
       <div className="grid grid-cols-3 gap-3">
         {[
           { val: "12 481", label: "Файлов обработано" },
@@ -261,11 +532,10 @@ function StudioSection() {
         ))}
       </div>
 
-      {/* CTA */}
       <button onClick={handleProcess} disabled={processing}
-        className="w-full py-4 rounded-xl font-display font-bold text-lg uppercase tracking-widest transition-all hover:scale-[1.02] hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full py-4 rounded-xl font-display font-bold text-lg uppercase tracking-widest transition-all hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed"
         style={{ background: processing ? 'var(--dark-border)' : 'linear-gradient(135deg, #00f5ff, #b24bff)', color: processing ? '#888' : 'black' }}>
-        {processing ? "Обрабатываю..." : "Запустить генерацию"}
+        {processing ? "Обрабатываю..." : "Запустить массовую обработку"}
       </button>
     </div>
   );
@@ -614,22 +884,33 @@ function BillingSection() {
 /* ─── MAIN ─── */
 export default function Index() {
   const [active, setActive] = useState<Section>("studio");
+  const [showAuth, setShowAuth] = useState(false);
+  const { user, loading, logout } = useAuth();
 
-  const sections: Record<Section, JSX.Element> = {
-    studio: <StudioSection />,
-    editor: <EditorSection />,
-    gallery: <GallerySection />,
-    billing: <BillingSection />,
-  };
+  // Show auth modal if code in URL was processed but no user
+  useEffect(() => {
+    if (!loading && !user && window.location.search.includes('error')) {
+      setShowAuth(true);
+    }
+  }, [loading, user]);
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--dark-bg)' }}>
       <GridBackground />
-      <Navbar active={active} setActive={setActive} />
+      <Navbar
+        active={active}
+        setActive={setActive}
+        user={user}
+        onLoginClick={() => setShowAuth(true)}
+        onLogout={logout}
+      />
       <Ticker />
 
       <main className="relative z-10 max-w-4xl mx-auto px-4 md:px-6 pt-24 pb-24">
-        {sections[active]}
+        {active === "studio" && <StudioSection user={user} onLoginRequired={() => setShowAuth(true)} />}
+        {active === "editor" && <EditorSection />}
+        {active === "gallery" && <GallerySection />}
+        {active === "billing" && <BillingSection />}
       </main>
 
       {/* Bottom mobile nav */}
@@ -650,6 +931,9 @@ export default function Index() {
           })}
         </div>
       </div>
+
+      {/* Auth Modal */}
+      {showAuth && <AuthModal onClose={() => setShowAuth(false)} />}
     </div>
   );
 }
