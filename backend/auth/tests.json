@@ -7,17 +7,17 @@
       "expectedStatus": 200
     },
     {
-      "name": "Empty prompt error",
+      "name": "Register weak password",
       "method": "POST",
       "path": "/",
-      "body": {"prompt": ""},
+      "body": {"action": "register", "email": "validate@example.com", "password": "12"},
       "expectedStatus": 400
     },
     {
-      "name": "No session token",
+      "name": "Login with wrong creds",
       "method": "POST",
       "path": "/",
-      "body": {"prompt": "test"},
+      "body": {"action": "login", "email": "nonexistent_xx@example.com", "password": "wrongpass"},
       "expectedStatus": 401
     }
   ]

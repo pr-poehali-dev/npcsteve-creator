@@ -7,17 +7,10 @@
       "expectedStatus": 200
     },
     {
-      "name": "Empty prompt error",
+      "name": "No token forbidden",
       "method": "POST",
       "path": "/",
-      "body": {"prompt": ""},
-      "expectedStatus": 400
-    },
-    {
-      "name": "No session token",
-      "method": "POST",
-      "path": "/",
-      "body": {"prompt": "test"},
+      "body": {"action": "stats"},
       "expectedStatus": 401
     }
   ]

@@ -1,6 +1,5 @@
 """
-Генерация изображений по текстовому описанию через fal.ai (FLUX модель).
-Сохраняет результат в S3 и историю в БД.
+Генерация изображений через fal.ai (FLUX). Требует авторизации, списывает 1 единицу с баланса.
 """
 import json
 import os
@@ -14,32 +13,76 @@ import boto3
 CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token',
+    'Access-Control-Allow-Headers': 'Content-Type, X-User-Id, X-Auth-Token, X-Session-Token',
 }
 
 
+def resp(status: int, data: dict) -> dict:
+    return {'statusCode': status, 'headers': {**CORS_HEADERS, 'Content-Type': 'application/json'}, 'body': json.dumps(data)}
+
+
 def handler(event: dict, context) -> dict:
+    """Генерация изображения по текстовому описанию. Требует session_token, списывает 1 единицу баланса."""
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
 
     try:
         body = json.loads(event.get('body') or '{}')
     except Exception:
-        return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'Invalid JSON'})}
+        return resp(400, {'error': 'Invalid JSON'})
 
     prompt = (body.get('prompt') or '').strip()
     if not prompt:
-        return {'statusCode': 400, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'prompt обязателен'})}
+        return resp(400, {'error': 'prompt обязателен'})
 
-    user_id = body.get('user_id')
+    headers = event.get('headers') or {}
+    session_token = headers.get('X-Session-Token') or headers.get('x-session-token') or body.get('session_token', '')
+    if not session_token:
+        return resp(401, {'error': 'Нужно войти в аккаунт'})
+
     model = body.get('model', 'fal-ai/flux/schnell')
     image_size = body.get('image_size', 'square_hd')
 
+    conn = psycopg2.connect(os.environ['DATABASE_URL'])
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.id, u.balance FROM sessions s JOIN users u ON s.user_id = u.id
+            WHERE s.token = %s AND s.expires_at > NOW()
+        """, (session_token,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return resp(401, {'error': 'Сессия истекла, войдите заново'})
+        user_id, balance = row[0], row[1] or 0
+        if balance < 1:
+            cur.close()
+            return resp(402, {'error': 'Недостаточно генераций. Активируйте промокод в профиле.'})
+        # списываем заранее, чтобы избежать гонок
+        cur.execute("UPDATE users SET balance = balance - 1 WHERE id = %s AND balance > 0 RETURNING balance", (user_id,))
+        debited = cur.fetchone()
+        if not debited:
+            cur.close()
+            return resp(402, {'error': 'Недостаточно генераций'})
+        new_balance = debited[0]
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        conn.close()
+        return resp(500, {'error': f'DB error: {e}'})
+
     fal_key = os.environ.get('FAL_API_KEY', '')
     if not fal_key:
-        return {'statusCode': 500, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'FAL_API_KEY не настроен'})}
+        # Возвращаем баланс
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET balance = balance + 1 WHERE id = %s", (user_id,))
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+        return resp(500, {'error': 'FAL_API_KEY не настроен'})
 
-    # Вызов fal.ai API
     fal_payload = json.dumps({
         'prompt': prompt,
         'image_size': image_size,
@@ -50,32 +93,45 @@ def handler(event: dict, context) -> dict:
     req = urllib.request.Request(
         f'https://fal.run/{model}',
         data=fal_payload,
-        headers={
-            'Authorization': f'Key {fal_key}',
-            'Content-Type': 'application/json',
-        },
+        headers={'Authorization': f'Key {fal_key}', 'Content-Type': 'application/json'},
         method='POST'
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            fal_result = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=60) as r:
+            fal_result = json.loads(r.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode('utf-8', errors='replace')
-        return {'statusCode': 502, 'headers': CORS_HEADERS, 'body': json.dumps({'error': f'fal.ai error: {err_body}'})}
+        # возврат баланса
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET balance = balance + 1 WHERE id = %s RETURNING balance", (user_id,))
+            new_balance = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+        finally:
+            pass
+        conn.close()
+        return resp(502, {'error': f'fal.ai error: {err_body}', 'balance': new_balance})
 
     images = fal_result.get('images') or []
     if not images:
-        return {'statusCode': 502, 'headers': CORS_HEADERS, 'body': json.dumps({'error': 'fal.ai не вернул изображение'})}
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET balance = balance + 1 WHERE id = %s RETURNING balance", (user_id,))
+            new_balance = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+        finally:
+            pass
+        conn.close()
+        return resp(502, {'error': 'fal.ai не вернул изображение', 'balance': new_balance})
 
     fal_image_url = images[0].get('url', '')
-
-    # Скачиваем изображение и кладём в S3
     s3_url = fal_image_url
     try:
         with urllib.request.urlopen(fal_image_url, timeout=30) as img_resp:
             img_data = img_resp.read()
-
         s3 = boto3.client(
             's3',
             endpoint_url='https://bucket.poehali.dev',
@@ -88,10 +144,8 @@ def handler(event: dict, context) -> dict:
     except Exception:
         pass
 
-    # Сохраняем в БД
     gen_id = None
     try:
-        conn = psycopg2.connect(os.environ['DATABASE_URL'])
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO generations (user_id, prompt, model, status, image_url) VALUES (%s, %s, %s, 'done', %s) RETURNING id",
@@ -100,17 +154,15 @@ def handler(event: dict, context) -> dict:
         gen_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
-        conn.close()
     except Exception:
         pass
+    finally:
+        conn.close()
 
-    return {
-        'statusCode': 200,
-        'headers': CORS_HEADERS,
-        'body': json.dumps({
-            'id': gen_id,
-            'image_url': s3_url,
-            'prompt': prompt,
-            'model': model,
-        })
-    }
+    return resp(200, {
+        'id': gen_id,
+        'image_url': s3_url,
+        'prompt': prompt,
+        'model': model,
+        'balance': new_balance,
+    })

@@ -1,85 +1,69 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Icon from "@/components/ui/icon";
 
-type Section = "studio" | "editor" | "gallery" | "billing";
-
-const HERO_IMAGE = "https://cdn.poehali.dev/projects/1da53510-a90a-4c19-87dc-ee717d9f851a/files/90016d74-ebc6-4d0f-bdfb-14671d849e86.jpg";
+type Section = "studio" | "editor" | "gallery" | "billing" | "profile" | "admin";
 
 const API = {
   generateImage: "https://functions.poehali.dev/bbac58dc-6753-4023-8a35-c179d54bc885",
-  authYandex: "https://functions.poehali.dev/a12ba70f-2805-4f06-bf02-5ae6965e01fd",
-  authMagic: "https://functions.poehali.dev/efd7b664-1bf7-4be7-9dbe-522fb47c3416",
+  auth: "https://functions.poehali.dev/3920ee9e-4cd2-4680-9249-1d957bea13a5",
+  admin: "https://functions.poehali.dev/a99ffa6e-6a99-4c20-83f9-e9e41a7f671c",
 };
 
 /* ─── USER CONTEXT ─── */
-type User = { id: number; name: string; email: string; avatar_url: string | null };
+type User = {
+  id: number;
+  name: string;
+  email: string;
+  avatar_url: string | null;
+  balance: number;
+  is_admin: boolean;
+  totp_enabled: boolean;
+};
 
 function useAuth() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const refresh = useCallback(async () => {
     const token = localStorage.getItem('session_token');
-    if (!token) { setLoading(false); return; }
-    fetch(API.authMagic, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
-      body: JSON.stringify({ action: 'me', session_token: token }),
-    })
-      .then(r => r.ok ? r.json() : null)
-      .then(u => { setUser(u); setLoading(false); })
-      .catch(() => setLoading(false));
+    if (!token) { setUser(null); setLoading(false); return; }
+    try {
+      const r = await fetch(API.auth, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+        body: JSON.stringify({ action: 'me' }),
+      });
+      if (!r.ok) { setUser(null); }
+      else setUser(await r.json());
+    } catch {
+      setUser(null);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  // Handle Yandex OAuth callback
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get('code');
-    if (!code) return;
-    const redirectUri = window.location.origin + window.location.pathname;
-    window.history.replaceState({}, '', window.location.pathname);
-    fetch(API.authYandex, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, redirect_uri: redirectUri }),
-    })
-      .then(r => r.json())
-      .then(data => {
-        if (data.session_token) {
-          localStorage.setItem('session_token', data.session_token);
-          setUser(data.user);
-        }
-      })
-      .catch(() => {});
-  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
 
-  // Handle Magic Link token in URL
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const magicToken = params.get('magic_token');
-    if (!magicToken) return;
-    window.history.replaceState({}, '', window.location.pathname);
-    fetch(API.authMagic, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'verify', token: magicToken }),
-    })
-      .then(r => r.json())
-      .then(data => {
-        if (data.session_token) {
-          localStorage.setItem('session_token', data.session_token);
-          setUser(data.user);
-        }
-      })
-      .catch(() => {});
-  }, []);
+    const handler = () => refresh();
+    window.addEventListener('balance-changed', handler);
+    return () => window.removeEventListener('balance-changed', handler);
+  }, [refresh]);
 
   const logout = useCallback(() => {
+    const token = localStorage.getItem('session_token');
+    if (token) {
+      fetch(API.auth, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+        body: JSON.stringify({ action: 'logout' }),
+      }).catch(() => {});
+    }
     localStorage.removeItem('session_token');
     setUser(null);
   }, []);
 
-  return { user, loading, setUser, logout };
+  return { user, loading, setUser, logout, refresh };
 }
 
 /* ─── MOCK DATA ─── */
@@ -126,35 +110,68 @@ function GridBackground() {
 }
 
 /* ─── AUTH MODAL ─── */
-function AuthModal({ onClose }: { onClose: () => void }) {
+function AuthModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (user: User) => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
-  const [sending, setSending] = useState(false);
-  const [sent, setSent] = useState(false);
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [pendingToken, setPendingToken] = useState('');
+  const [step, setStep] = useState<'creds' | '2fa'>('creds');
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const redirectUri = window.location.origin + window.location.pathname;
-  const yandexUrl = `https://oauth.yandex.ru/authorize?response_type=code&client_id=YOUR_CLIENT_ID&redirect_uri=${encodeURIComponent(redirectUri)}&scope=login%3Ainfo%20login%3Aemail`;
-
-  async function sendMagicLink() {
-    if (!email.trim() || !email.includes('@')) {
-      setError('Введите корректный email');
+  async function submit() {
+    setError('');
+    if (step === '2fa') {
+      if (!/^\d{6}$/.test(code)) { setError('Введите 6 цифр из приложения'); return; }
+      setBusy(true);
+      try {
+        const r = await fetch(API.auth, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'login-2fa', pending_token: pendingToken, code: code.trim() }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Ошибка входа');
+        localStorage.setItem('session_token', data.session_token);
+        onSuccess(data.user);
+        onClose();
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : 'Ошибка');
+      } finally {
+        setBusy(false);
+      }
       return;
     }
-    setSending(true);
-    setError('');
+
+    if (!email.trim() || !email.includes('@')) { setError('Введите корректный email'); return; }
+    if (password.length < 6) { setError('Пароль минимум 6 символов'); return; }
+
+    setBusy(true);
     try {
-      const r = await fetch(API.authMagic, {
+      const r = await fetch(API.auth, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'send', email: email.trim().toLowerCase(), site_url: window.location.origin }),
+        body: JSON.stringify({
+          action: mode === 'register' ? 'register' : 'login',
+          email: email.trim().toLowerCase(),
+          password,
+        }),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error || 'Ошибка отправки');
-      setSent(true);
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      if (data.requires_2fa) {
+        setPendingToken(data.pending_token);
+        setStep('2fa');
+        return;
+      }
+      localStorage.setItem('session_token', data.session_token);
+      onSuccess(data.user);
+      onClose();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Ошибка отправки');
+      setError(e instanceof Error ? e.message : 'Ошибка');
     } finally {
-      setSending(false);
+      setBusy(false);
     }
   }
 
@@ -170,87 +187,111 @@ function AuthModal({ onClose }: { onClose: () => void }) {
           <Icon name="X" size={18} />
         </button>
 
-        <div className="text-center mb-7">
+        <div className="text-center mb-6">
           <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4"
             style={{ background: 'linear-gradient(135deg, rgba(0,245,255,0.15), rgba(178,75,255,0.15))', border: '1px solid rgba(0,245,255,0.2)' }}>
-            <Icon name="Sparkles" size={28} className="text-neon-cyan" />
+            <Icon name={step === '2fa' ? 'ShieldCheck' : 'Sparkles'} size={28} className="text-neon-cyan" />
           </div>
-          <h2 className="font-display text-2xl font-bold uppercase tracking-wider text-white">Войти в LUMIX AI</h2>
-          <p className="font-body text-sm text-muted-foreground mt-2">Без пароля — просто email</p>
+          <h2 className="font-display text-2xl font-bold uppercase tracking-wider text-white">
+            {step === '2fa' ? 'Код из приложения' : (mode === 'login' ? 'Вход в LUMIX AI' : 'Регистрация')}
+          </h2>
+          <p className="font-body text-sm text-muted-foreground mt-2">
+            {step === '2fa' ? 'Откройте Google Authenticator и введите 6 цифр' : 'Email и пароль — без СМС'}
+          </p>
         </div>
 
-        {sent ? (
-          /* ── Успешно отправлено ── */
-          <div className="text-center py-4 animate-fade-in">
-            <div className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
-              style={{ background: 'rgba(0,245,255,0.1)', border: '1px solid rgba(0,245,255,0.3)' }}>
-              <Icon name="Mail" size={26} className="text-neon-cyan" />
-            </div>
-            <p className="font-body font-semibold text-white mb-2">Письмо отправлено!</p>
-            <p className="font-body text-sm text-muted-foreground leading-relaxed">
-              Проверьте <span className="text-white">{email}</span> — там ссылка для входа. Действует 15 минут.
-            </p>
-            <button onClick={() => { setSent(false); setEmail(''); }}
-              className="mt-5 text-xs font-body text-muted-foreground hover:text-white transition-colors underline underline-offset-2">
-              Отправить на другой email
-            </button>
+        {step === 'creds' && (
+          <div className="flex gap-1 p-1 mb-4 rounded-xl" style={{ background: 'rgba(255,255,255,0.04)' }}>
+            {(['login', 'register'] as const).map(m => (
+              <button key={m} onClick={() => { setMode(m); setError(''); }}
+                className="flex-1 py-2 rounded-lg text-xs font-body font-semibold transition-all"
+                style={mode === m
+                  ? { background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }
+                  : { color: '#888' }}>
+                {m === 'login' ? 'Войти' : 'Регистрация'}
+              </button>
+            ))}
           </div>
-        ) : (
-          /* ── Форма ── */
-          <div className="space-y-3">
+        )}
+
+        <div className="space-y-3">
+          {step === 'creds' && (
+            <>
+              <div className="relative">
+                <Icon name="Mail" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="email"
+                  value={email}
+                  onChange={e => { setEmail(e.target.value); setError(''); }}
+                  placeholder="your@email.com"
+                  className="w-full pl-10 pr-4 py-3 rounded-xl font-body text-sm outline-none transition-all placeholder:text-muted-foreground"
+                  style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }}
+                  autoFocus
+                />
+              </div>
+              <div className="relative">
+                <Icon name="Lock" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={e => { setPassword(e.target.value); setError(''); }}
+                  onKeyDown={e => e.key === 'Enter' && submit()}
+                  placeholder="Пароль (мин. 6 символов)"
+                  className="w-full pl-10 pr-4 py-3 rounded-xl font-body text-sm outline-none transition-all placeholder:text-muted-foreground"
+                  style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }}
+                />
+              </div>
+            </>
+          )}
+
+          {step === '2fa' && (
             <div className="relative">
-              <Icon name="Mail" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Icon name="KeyRound" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
               <input
-                type="email"
-                value={email}
-                onChange={e => { setEmail(e.target.value); setError(''); }}
-                onKeyDown={e => e.key === 'Enter' && sendMagicLink()}
-                placeholder="your@email.com"
-                className="w-full pl-10 pr-4 py-3 rounded-xl font-body text-sm outline-none transition-all placeholder:text-muted-foreground"
-                style={{ background: 'rgba(255,255,255,0.04)', border: `1px solid ${error ? 'rgba(255,45,155,0.5)' : 'var(--dark-border)'}`, color: 'white' }}
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                value={code}
+                onChange={e => { setCode(e.target.value.replace(/\D/g, '').slice(0, 6)); setError(''); }}
+                onKeyDown={e => e.key === 'Enter' && submit()}
+                placeholder="000000"
+                className="w-full pl-10 pr-4 py-3 rounded-xl font-display text-center text-xl tracking-[0.5em] outline-none transition-all"
+                style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }}
                 autoFocus
               />
             </div>
+          )}
 
-            {error && (
-              <p className="text-xs font-body text-neon-pink flex items-center gap-1">
-                <Icon name="AlertCircle" size={12} />
-                {error}
-              </p>
+          {error && (
+            <p className="text-xs font-body text-neon-pink flex items-center gap-1">
+              <Icon name="AlertCircle" size={12} />
+              {error}
+            </p>
+          )}
+
+          <button onClick={submit} disabled={busy}
+            className="w-full py-3.5 rounded-xl font-body font-semibold transition-all hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed"
+            style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
+            {busy ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="w-4 h-4 rounded-full border-2 border-black border-t-transparent animate-spin" />
+                Подождите...
+              </span>
+            ) : (
+              <span className="flex items-center justify-center gap-2">
+                <Icon name={step === '2fa' ? 'ShieldCheck' : (mode === 'login' ? 'LogIn' : 'UserPlus')} size={16} />
+                {step === '2fa' ? 'Подтвердить' : (mode === 'login' ? 'Войти' : 'Создать аккаунт')}
+              </span>
             )}
+          </button>
 
-            <button onClick={sendMagicLink} disabled={sending}
-              className="w-full py-3.5 rounded-xl font-body font-semibold transition-all hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
-              {sending ? (
-                <span className="flex items-center justify-center gap-2">
-                  <span className="w-4 h-4 rounded-full border-2 border-black border-t-transparent animate-spin" />
-                  Отправляю...
-                </span>
-              ) : (
-                <span className="flex items-center justify-center gap-2">
-                  <Icon name="Send" size={16} />
-                  Отправить ссылку
-                </span>
-              )}
+          {step === '2fa' && (
+            <button onClick={() => { setStep('creds'); setCode(''); setError(''); }}
+              className="w-full text-xs font-body text-muted-foreground hover:text-white transition-colors">
+              ← Назад
             </button>
-
-            <div className="flex items-center gap-3 my-1">
-              <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
-              <span className="text-xs font-body text-muted-foreground">или</span>
-              <div className="flex-1 h-px" style={{ background: 'var(--dark-border)' }} />
-            </div>
-
-            <a href={yandexUrl}
-              className="flex items-center justify-center gap-3 w-full py-3 rounded-xl font-body font-semibold text-white transition-all hover:scale-[1.02]"
-              style={{ background: 'rgba(252,63,29,0.15)', border: '1px solid rgba(252,63,29,0.3)' }}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="#fc3f1d">
-                <path d="M13.4 12.4L8.6 4H11.4L14.8 10.4L18 4H20.8L16 12.4L21.4 22H18.6L14.6 14.8L10.4 22H7.6L13.4 12.4ZM5.8 4H3V22H5.8V4Z"/>
-              </svg>
-              <span style={{ color: '#fc3f1d' }}>Войти через Яндекс ID</span>
-            </a>
-          </div>
-        )}
+          )}
+        </div>
 
         <p className="text-center text-xs font-body text-muted-foreground mt-5">
           Регистрируясь, вы принимаете условия использования
@@ -304,34 +345,60 @@ function Navbar({
         </div>
 
         {user ? (
-          <div className="relative">
-            <button onClick={() => setUserMenu(v => !v)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all hover:scale-105"
-              style={{ background: 'rgba(30,30,46,0.8)', border: '1px solid var(--dark-border)' }}>
-              {user.avatar_url
-                ? <img src={user.avatar_url} alt={user.name} className="w-6 h-6 rounded-full object-cover" />
-                : <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-black"
-                    style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
-                    {user.name?.[0] || '?'}
-                  </div>
-              }
-              <span className="text-sm font-body text-white hidden sm:block">{user.name?.split(' ')[0]}</span>
-              <Icon name="ChevronDown" size={14} className="text-muted-foreground" />
+          <div className="flex items-center gap-2">
+            {/* Balance pill */}
+            <button onClick={() => setActive('profile')}
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-body font-semibold transition-all hover:scale-105"
+              style={{ background: 'rgba(0,245,255,0.08)', border: '1px solid rgba(0,245,255,0.25)', color: '#00f5ff' }}>
+              <Icon name="Sparkles" size={12} />
+              {user.balance}
             </button>
-            {userMenu && (
-              <div className="absolute right-0 top-full mt-2 w-48 rounded-xl overflow-hidden shadow-2xl z-50 animate-scale-in"
-                style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
-                <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--dark-border)' }}>
-                  <p className="font-body font-semibold text-white text-sm">{user.name}</p>
-                  <p className="font-body text-xs text-muted-foreground truncate">{user.email}</p>
+            <div className="relative">
+              <button onClick={() => setUserMenu(v => !v)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all hover:scale-105"
+                style={{ background: 'rgba(30,30,46,0.8)', border: '1px solid var(--dark-border)' }}>
+                {user.avatar_url
+                  ? <img src={user.avatar_url} alt={user.name} className="w-6 h-6 rounded-full object-cover" />
+                  : <div className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold text-black"
+                      style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
+                      {user.name?.[0] || '?'}
+                    </div>
+                }
+                <span className="text-sm font-body text-white hidden sm:block">{user.name?.split(' ')[0]}</span>
+                <Icon name="ChevronDown" size={14} className="text-muted-foreground" />
+              </button>
+              {userMenu && (
+                <div className="absolute right-0 top-full mt-2 w-56 rounded-xl overflow-hidden shadow-2xl z-50 animate-scale-in"
+                  style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+                  <div className="px-4 py-3 border-b" style={{ borderColor: 'var(--dark-border)' }}>
+                    <p className="font-body font-semibold text-white text-sm truncate">{user.name}</p>
+                    <p className="font-body text-xs text-muted-foreground truncate">{user.email}</p>
+                    <div className="flex items-center gap-1 mt-2 text-xs font-body" style={{ color: '#00f5ff' }}>
+                      <Icon name="Sparkles" size={12} />
+                      <span>{user.balance} генераций</span>
+                    </div>
+                  </div>
+                  <button onClick={() => { setActive('profile'); setUserMenu(false); }}
+                    className="w-full flex items-center gap-2 px-4 py-3 text-sm font-body text-muted-foreground hover:text-white hover:bg-white/5 transition-colors">
+                    <Icon name="User" size={14} />
+                    Профиль
+                  </button>
+                  {user.is_admin && (
+                    <button onClick={() => { setActive('admin'); setUserMenu(false); }}
+                      className="w-full flex items-center gap-2 px-4 py-3 text-sm font-body text-muted-foreground hover:text-white hover:bg-white/5 transition-colors">
+                      <Icon name="ShieldAlert" size={14} className="text-neon-pink" />
+                      Админ-панель
+                    </button>
+                  )}
+                  <div className="h-px" style={{ background: 'var(--dark-border)' }} />
+                  <button onClick={() => { onLogout(); setUserMenu(false); }}
+                    className="w-full flex items-center gap-2 px-4 py-3 text-sm font-body text-muted-foreground hover:text-white hover:bg-white/5 transition-colors">
+                    <Icon name="LogOut" size={14} />
+                    Выйти
+                  </button>
                 </div>
-                <button onClick={() => { onLogout(); setUserMenu(false); }}
-                  className="w-full flex items-center gap-2 px-4 py-3 text-sm font-body text-muted-foreground hover:text-white hover:bg-white/5 transition-colors">
-                  <Icon name="LogOut" size={14} />
-                  Выйти
-                </button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         ) : (
           <button onClick={onLoginClick}
@@ -393,18 +460,16 @@ function TextToImage({ user, onLoginRequired }: { user: User | null; onLoginRequ
     setError("");
     setResult(null);
     try {
+      const token = localStorage.getItem('session_token') || '';
       const r = await fetch(API.generateImage, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          image_size: imgSize,
-          user_id: user?.id,
-        }),
+        headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+        body: JSON.stringify({ prompt, image_size: imgSize }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || 'Ошибка генерации');
       setResult(data);
+      window.dispatchEvent(new CustomEvent('balance-changed'));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Ошибка');
     } finally {
@@ -1009,18 +1074,466 @@ function BillingSection() {
   );
 }
 
+/* ─── PROFILE SECTION ─── */
+function ProfileSection({ user, onUpdated, onLogout }: { user: User; onUpdated: () => void; onLogout: () => void }) {
+  const [promo, setPromo] = useState('');
+  const [promoMsg, setPromoMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // TOTP setup state
+  const [totpSetup, setTotpSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [totpMsg, setTotpMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Disable TOTP
+  const [disablePass, setDisablePass] = useState('');
+  const [showDisable, setShowDisable] = useState(false);
+
+  function authHeaders() {
+    const t = localStorage.getItem('session_token') || '';
+    return { 'Content-Type': 'application/json', 'X-Session-Token': t };
+  }
+
+  async function applyPromo() {
+    if (!promo.trim()) return;
+    setBusy(true); setPromoMsg(null);
+    try {
+      const r = await fetch(API.auth, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ action: 'redeem-promo', code: promo.trim() }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      setPromoMsg({ type: 'ok', text: `+${data.amount} генераций. Баланс: ${data.balance}` });
+      setPromo('');
+      onUpdated();
+    } catch (e: unknown) {
+      setPromoMsg({ type: 'err', text: e instanceof Error ? e.message : 'Ошибка' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startTotpSetup() {
+    setBusy(true); setTotpMsg(null);
+    try {
+      const r = await fetch(API.auth, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ action: 'totp-setup' }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      setTotpSetup(data);
+    } catch (e: unknown) {
+      setTotpMsg({ type: 'err', text: e instanceof Error ? e.message : 'Ошибка' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmTotp() {
+    if (!/^\d{6}$/.test(totpCode)) { setTotpMsg({ type: 'err', text: 'Введите 6 цифр' }); return; }
+    setBusy(true); setTotpMsg(null);
+    try {
+      const r = await fetch(API.auth, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ action: 'totp-enable', code: totpCode }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      setTotpMsg({ type: 'ok', text: '2FA включена' });
+      setTotpSetup(null);
+      setTotpCode('');
+      onUpdated();
+    } catch (e: unknown) {
+      setTotpMsg({ type: 'err', text: e instanceof Error ? e.message : 'Ошибка' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disableTotp() {
+    if (!disablePass) { setTotpMsg({ type: 'err', text: 'Введите пароль' }); return; }
+    setBusy(true); setTotpMsg(null);
+    try {
+      const r = await fetch(API.auth, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ action: 'totp-disable', password: disablePass }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      setTotpMsg({ type: 'ok', text: '2FA отключена' });
+      setDisablePass(''); setShowDisable(false);
+      onUpdated();
+    } catch (e: unknown) {
+      setTotpMsg({ type: 'err', text: e instanceof Error ? e.message : 'Ошибка' });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const otpauthQr = totpSetup
+    ? `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(totpSetup.otpauth_url)}`
+    : '';
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      {/* Header card */}
+      <div className="p-6 rounded-2xl flex items-center gap-4" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+        <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-2xl font-display font-bold text-black"
+          style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)' }}>
+          {(user.name || user.email)[0]?.toUpperCase()}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="font-display text-lg font-bold text-white truncate">{user.name || user.email}</p>
+          <p className="font-body text-sm text-muted-foreground truncate">{user.email}</p>
+          {user.is_admin && (
+            <span className="inline-block mt-1 px-2 py-0.5 rounded-full text-[10px] font-display uppercase tracking-wider"
+              style={{ background: 'rgba(255,45,155,0.15)', border: '1px solid rgba(255,45,155,0.4)', color: '#ff2d9b' }}>
+              Админ
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Balance card */}
+      <div className="p-6 rounded-2xl text-center" style={{ background: 'linear-gradient(135deg, rgba(0,245,255,0.08), rgba(178,75,255,0.08))', border: '1px solid rgba(0,245,255,0.25)' }}>
+        <p className="font-body text-xs uppercase tracking-widest text-muted-foreground mb-2">Баланс генераций</p>
+        <div className="font-display text-5xl font-bold gradient-text mb-2">{user.balance}</div>
+        <p className="font-body text-xs text-muted-foreground">1 генерация = 1 единица</p>
+      </div>
+
+      {/* Promo */}
+      <div className="p-6 rounded-2xl space-y-3" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+        <div className="flex items-center gap-2">
+          <Icon name="Ticket" size={18} className="text-neon-cyan" />
+          <h3 className="font-display font-bold uppercase tracking-wider text-white">Активировать промокод</h3>
+        </div>
+        <div className="flex gap-2">
+          <input type="text" value={promo} onChange={e => { setPromo(e.target.value.toUpperCase()); setPromoMsg(null); }}
+            placeholder="ВАШ-КОД"
+            className="flex-1 px-4 py-3 rounded-xl font-display text-sm tracking-widest outline-none uppercase"
+            style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+          <button onClick={applyPromo} disabled={busy || !promo.trim()}
+            className="px-5 rounded-xl font-body font-semibold disabled:opacity-50 transition-all hover:scale-105"
+            style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
+            Применить
+          </button>
+        </div>
+        {promoMsg && (
+          <p className="text-xs font-body flex items-center gap-1" style={{ color: promoMsg.type === 'ok' ? '#00f5ff' : '#ff2d9b' }}>
+            <Icon name={promoMsg.type === 'ok' ? 'CheckCircle2' : 'AlertCircle'} size={12} />
+            {promoMsg.text}
+          </p>
+        )}
+        <a href="https://t.me/Niger_epta" target="_blank" rel="noopener"
+          className="flex items-center justify-center gap-2 text-sm font-body text-muted-foreground hover:text-white transition-colors py-2">
+          <Icon name="Send" size={14} />
+          Купить промокод в Telegram → @Niger_epta
+        </a>
+      </div>
+
+      {/* TOTP / 2FA */}
+      <div className="p-6 rounded-2xl space-y-3" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Icon name="ShieldCheck" size={18} className={user.totp_enabled ? 'text-neon-cyan' : 'text-muted-foreground'} />
+            <h3 className="font-display font-bold uppercase tracking-wider text-white">Двухфакторка (TOTP)</h3>
+          </div>
+          {user.totp_enabled && <span className="text-xs font-body text-neon-cyan">Включено</span>}
+        </div>
+        <p className="font-body text-xs text-muted-foreground leading-relaxed">
+          Google Authenticator, Authy, 1Password или Яндекс.Ключ — любое TOTP-приложение.
+        </p>
+
+        {!user.totp_enabled && !totpSetup && (
+          <button onClick={startTotpSetup} disabled={busy}
+            className="w-full py-3 rounded-xl font-body font-semibold transition-all hover:scale-[1.02] disabled:opacity-50"
+            style={{ background: 'rgba(0,245,255,0.1)', border: '1px solid rgba(0,245,255,0.3)', color: '#00f5ff' }}>
+            Подключить 2FA
+          </button>
+        )}
+
+        {totpSetup && (
+          <div className="space-y-3 p-4 rounded-xl" style={{ background: 'rgba(0,245,255,0.04)', border: '1px solid rgba(0,245,255,0.2)' }}>
+            <p className="text-xs font-body text-muted-foreground">1. Отсканируйте QR в приложении-аутентификаторе:</p>
+            <div className="flex justify-center">
+              <img src={otpauthQr} alt="QR" className="w-44 h-44 rounded-lg bg-white p-2" />
+            </div>
+            <p className="text-xs font-body text-muted-foreground">или введите вручную секрет:</p>
+            <div className="px-3 py-2 rounded-lg font-mono text-xs text-neon-cyan break-all"
+              style={{ background: 'rgba(0,0,0,0.4)', border: '1px solid var(--dark-border)' }}>
+              {totpSetup.secret}
+            </div>
+            <p className="text-xs font-body text-muted-foreground">2. Введите 6 цифр из приложения:</p>
+            <input type="text" inputMode="numeric" maxLength={6}
+              value={totpCode} onChange={e => setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="000000"
+              className="w-full px-4 py-3 rounded-xl font-display text-center text-xl tracking-[0.5em] outline-none"
+              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+            <button onClick={confirmTotp} disabled={busy}
+              className="w-full py-3 rounded-xl font-body font-semibold disabled:opacity-50"
+              style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
+              Подтвердить
+            </button>
+          </div>
+        )}
+
+        {user.totp_enabled && !showDisable && (
+          <button onClick={() => setShowDisable(true)}
+            className="w-full py-3 rounded-xl font-body text-sm text-muted-foreground hover:text-neon-pink transition-colors"
+            style={{ border: '1px solid var(--dark-border)' }}>
+            Отключить 2FA
+          </button>
+        )}
+
+        {user.totp_enabled && showDisable && (
+          <div className="space-y-2 p-4 rounded-xl" style={{ background: 'rgba(255,45,155,0.04)', border: '1px solid rgba(255,45,155,0.2)' }}>
+            <p className="text-xs font-body text-muted-foreground">Подтвердите паролем:</p>
+            <input type="password" value={disablePass} onChange={e => setDisablePass(e.target.value)}
+              placeholder="Текущий пароль"
+              className="w-full px-4 py-3 rounded-xl font-body text-sm outline-none"
+              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+            <div className="flex gap-2">
+              <button onClick={() => { setShowDisable(false); setDisablePass(''); }}
+                className="flex-1 py-2.5 rounded-xl text-sm font-body text-muted-foreground"
+                style={{ border: '1px solid var(--dark-border)' }}>
+                Отмена
+              </button>
+              <button onClick={disableTotp} disabled={busy}
+                className="flex-1 py-2.5 rounded-xl text-sm font-body font-semibold text-white disabled:opacity-50"
+                style={{ background: 'rgba(255,45,155,0.6)' }}>
+                Отключить
+              </button>
+            </div>
+          </div>
+        )}
+
+        {totpMsg && (
+          <p className="text-xs font-body flex items-center gap-1" style={{ color: totpMsg.type === 'ok' ? '#00f5ff' : '#ff2d9b' }}>
+            <Icon name={totpMsg.type === 'ok' ? 'CheckCircle2' : 'AlertCircle'} size={12} />
+            {totpMsg.text}
+          </p>
+        )}
+      </div>
+
+      <button onClick={onLogout}
+        className="w-full py-3 rounded-xl font-body text-sm text-muted-foreground hover:text-white transition-colors flex items-center justify-center gap-2"
+        style={{ border: '1px solid var(--dark-border)' }}>
+        <Icon name="LogOut" size={14} />
+        Выйти из аккаунта
+      </button>
+    </div>
+  );
+}
+
+/* ─── ADMIN SECTION ─── */
+type PromoItem = {
+  id: number; code: string; amount: number;
+  created_at: string; used_at: string | null; comment: string | null;
+  used_by_email: string | null;
+};
+type Stats = { users: number; promo_total: number; promo_used: number; promo_redeemed_amount: number; generations: number };
+
+function AdminSection() {
+  const [amount, setAmount] = useState(50);
+  const [count, setCount] = useState(1);
+  const [comment, setComment] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [items, setItems] = useState<PromoItem[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [error, setError] = useState('');
+  const [created, setCreated] = useState<PromoItem[]>([]);
+
+  function authHeaders() {
+    const t = localStorage.getItem('session_token') || '';
+    return { 'Content-Type': 'application/json', 'X-Session-Token': t };
+  }
+
+  async function loadAll() {
+    setError('');
+    try {
+      const [r1, r2] = await Promise.all([
+        fetch(API.admin, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: 'list-promo' }) }),
+        fetch(API.admin, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ action: 'stats' }) }),
+      ]);
+      const d1 = await r1.json(); const d2 = await r2.json();
+      if (!r1.ok) throw new Error(d1.error || 'Ошибка');
+      if (!r2.ok) throw new Error(d2.error || 'Ошибка');
+      setItems(d1.items || []);
+      setStats(d2);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Ошибка');
+    }
+  }
+
+  useEffect(() => { loadAll(); }, []);
+
+  async function createPromo() {
+    if (amount < 1) return;
+    setBusy(true); setError(''); setCreated([]);
+    try {
+      const r = await fetch(API.admin, {
+        method: 'POST', headers: authHeaders(),
+        body: JSON.stringify({ action: 'create-promo', amount, count, comment: comment.trim() }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Ошибка');
+      setCreated(data.created || []);
+      setComment('');
+      loadAll();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Ошибка');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function copy(txt: string) {
+    navigator.clipboard?.writeText(txt);
+  }
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      <div>
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-body mb-3"
+          style={{ background: 'rgba(255,45,155,0.1)', border: '1px solid rgba(255,45,155,0.3)', color: '#ff2d9b' }}>
+          <Icon name="ShieldAlert" size={12} />
+          Только для администратора
+        </div>
+        <h2 className="font-display text-3xl font-bold uppercase text-white">Админ-панель</h2>
+        <p className="font-body text-sm text-muted-foreground mt-1">Создание промокодов после оплаты в <a href="https://t.me/Niger_epta" target="_blank" rel="noopener" className="text-neon-cyan underline underline-offset-2">@Niger_epta</a></p>
+      </div>
+
+      {stats && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { label: 'Пользователи', val: stats.users, icon: 'Users' },
+            { label: 'Промокодов', val: stats.promo_total, icon: 'Ticket' },
+            { label: 'Активировано', val: stats.promo_used, icon: 'CheckCircle2' },
+            { label: 'Генераций', val: stats.generations, icon: 'Sparkles' },
+          ].map(s => (
+            <div key={s.label} className="p-4 rounded-xl" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+              <Icon name={s.icon} size={16} className="text-neon-cyan mb-2" />
+              <div className="font-display text-2xl font-bold text-white">{s.val}</div>
+              <div className="text-xs font-body text-muted-foreground">{s.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create promo */}
+      <div className="p-6 rounded-2xl space-y-4" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+        <h3 className="font-display font-bold uppercase tracking-wider text-white">Создать промокод</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs font-body text-muted-foreground">Генераций в коде</label>
+            <input type="number" min={1} value={amount} onChange={e => setAmount(Math.max(1, parseInt(e.target.value) || 1))}
+              className="w-full mt-1 px-4 py-3 rounded-xl font-body text-sm outline-none"
+              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+          </div>
+          <div>
+            <label className="text-xs font-body text-muted-foreground">Сколько кодов</label>
+            <input type="number" min={1} max={100} value={count} onChange={e => setCount(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+              className="w-full mt-1 px-4 py-3 rounded-xl font-body text-sm outline-none"
+              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+          </div>
+        </div>
+        <div>
+          <label className="text-xs font-body text-muted-foreground">Комментарий (для кого/за что)</label>
+          <input type="text" value={comment} onChange={e => setComment(e.target.value)}
+            placeholder="например: оплата от @username 990₽"
+            className="w-full mt-1 px-4 py-3 rounded-xl font-body text-sm outline-none"
+            style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid var(--dark-border)', color: 'white' }} />
+        </div>
+        <button onClick={createPromo} disabled={busy}
+          className="w-full py-3 rounded-xl font-body font-semibold disabled:opacity-50 hover:scale-[1.02] transition-all"
+          style={{ background: 'linear-gradient(135deg, #00f5ff, #b24bff)', color: 'black' }}>
+          Создать
+        </button>
+        {error && <p className="text-xs font-body text-neon-pink">{error}</p>}
+
+        {created.length > 0 && (
+          <div className="space-y-2 p-4 rounded-xl" style={{ background: 'rgba(0,245,255,0.04)', border: '1px solid rgba(0,245,255,0.2)' }}>
+            <p className="text-xs font-body text-neon-cyan">Скопируйте и отправьте клиенту:</p>
+            {created.map(c => (
+              <div key={c.id} className="flex items-center gap-2">
+                <code className="flex-1 px-3 py-2 rounded-lg font-mono text-sm text-white"
+                  style={{ background: 'rgba(0,0,0,0.4)', border: '1px solid var(--dark-border)' }}>
+                  {c.code}
+                </code>
+                <span className="text-xs font-body text-muted-foreground">{c.amount} ген.</span>
+                <button onClick={() => copy(c.code)} className="p-2 rounded-lg hover:bg-white/5 transition-colors">
+                  <Icon name="Copy" size={14} className="text-neon-cyan" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* List */}
+      <div className="p-6 rounded-2xl space-y-3" style={{ background: 'var(--dark-card)', border: '1px solid var(--dark-border)' }}>
+        <h3 className="font-display font-bold uppercase tracking-wider text-white">Все промокоды ({items.length})</h3>
+        <div className="space-y-2 max-h-96 overflow-y-auto">
+          {items.map(p => (
+            <div key={p.id} className="flex items-center gap-3 p-3 rounded-xl text-sm"
+              style={{ background: p.used_at ? 'rgba(255,255,255,0.02)' : 'rgba(0,245,255,0.04)', border: '1px solid var(--dark-border)' }}>
+              <code className="font-mono text-xs text-white">{p.code}</code>
+              <span className="text-xs font-body text-muted-foreground">{p.amount}</span>
+              {p.used_at ? (
+                <span className="ml-auto text-xs font-body text-muted-foreground truncate">
+                  использован: {p.used_by_email || '—'}
+                </span>
+              ) : (
+                <>
+                  <span className="ml-auto text-xs font-body text-neon-cyan">активен</span>
+                  <button onClick={() => copy(p.code)} className="p-1 rounded hover:bg-white/5">
+                    <Icon name="Copy" size={12} className="text-neon-cyan" />
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+          {items.length === 0 && <p className="text-xs font-body text-muted-foreground text-center py-6">Промокодов пока нет</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ─── MAIN ─── */
 export default function Index() {
   const [active, setActive] = useState<Section>("studio");
   const [showAuth, setShowAuth] = useState(false);
-  const { user, loading, logout } = useAuth();
+  const { user, loading, logout, refresh, setUser } = useAuth();
 
-  // Show auth modal if code in URL was processed but no user
   useEffect(() => {
     if (!loading && !user && window.location.search.includes('error')) {
       setShowAuth(true);
     }
   }, [loading, user]);
+
+  // Если попали в profile/admin без авторизации — открываем модалку
+  useEffect(() => {
+    if ((active === 'profile' || active === 'admin') && !loading && !user) {
+      setShowAuth(true);
+      setActive('studio');
+    }
+    if (active === 'admin' && user && !user.is_admin) {
+      setActive('studio');
+    }
+  }, [active, user, loading]);
+
+  const navItems: { s: Section; icon: string; label: string; show: boolean }[] = [
+    { s: 'studio', icon: 'Wand2', label: 'Студия', show: true },
+    { s: 'editor', icon: 'Film', label: 'Редактор', show: true },
+    { s: 'gallery', icon: 'LayoutGrid', label: 'Галерея', show: true },
+    { s: 'billing', icon: 'CreditCard', label: 'Биллинг', show: true },
+    { s: 'profile', icon: 'User', label: 'Профиль', show: !!user },
+    { s: 'admin', icon: 'ShieldAlert', label: 'Админ', show: !!user?.is_admin },
+  ];
+  const visibleNav = navItems.filter(i => i.show);
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--dark-bg)' }}>
@@ -1034,26 +1547,27 @@ export default function Index() {
       />
       <Ticker />
 
-      <main className="relative z-10 max-w-4xl mx-auto px-4 md:px-6 pt-24 pb-24">
+      {/* отступ снизу: nav (~64px) + бейдж Poehali (~70px) = 140px на мобильных, 80px на десктопе */}
+      <main className="relative z-10 max-w-4xl mx-auto px-4 md:px-6 pt-24 pb-[160px] md:pb-24">
         {active === "studio" && <StudioSection user={user} onLoginRequired={() => setShowAuth(true)} />}
         {active === "editor" && <EditorSection />}
         {active === "gallery" && <GallerySection />}
         {active === "billing" && <BillingSection />}
+        {active === "profile" && user && <ProfileSection user={user} onUpdated={refresh} onLogout={() => { logout(); setActive('studio'); }} />}
+        {active === "admin" && user?.is_admin && <AdminSection />}
       </main>
 
-      {/* Bottom mobile nav */}
-      <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t glass"
-        style={{ borderColor: 'var(--dark-border)' }}>
-        <div className="flex">
-          {(["studio", "editor", "gallery", "billing"] as Section[]).map((s) => {
-            const icons: Record<Section, string> = { studio: "Wand2", editor: "Film", gallery: "LayoutGrid", billing: "CreditCard" };
-            const labels: Record<Section, string> = { studio: "Студия", editor: "Редактор", gallery: "Галерея", billing: "Биллинг" };
+      {/* Bottom mobile nav — приподнят над бейджем Poehali */}
+      <div className="md:hidden fixed left-0 right-0 z-50 border-t glass"
+        style={{ borderColor: 'var(--dark-border)', bottom: '70px' }}>
+        <div className="flex overflow-x-auto">
+          {visibleNav.map(({ s, icon, label }) => {
             const isActive = active === s;
             return (
               <button key={s} onClick={() => setActive(s)}
-                className={`flex-1 py-3 flex flex-col items-center gap-1 transition-all ${isActive ? "" : "opacity-50"}`}>
-                <Icon name={icons[s]} size={20} className={isActive ? "text-neon-cyan" : "text-muted-foreground"} />
-                <span className={`text-[10px] font-display uppercase tracking-wider ${isActive ? "text-neon-cyan" : "text-muted-foreground"}`}>{labels[s]}</span>
+                className={`flex-1 min-w-[64px] py-3 flex flex-col items-center gap-1 transition-all ${isActive ? "" : "opacity-50"}`}>
+                <Icon name={icon} size={20} className={isActive ? "text-neon-cyan" : "text-muted-foreground"} />
+                <span className={`text-[10px] font-display uppercase tracking-wider whitespace-nowrap ${isActive ? "text-neon-cyan" : "text-muted-foreground"}`}>{label}</span>
               </button>
             );
           })}
@@ -1061,7 +1575,7 @@ export default function Index() {
       </div>
 
       {/* Auth Modal */}
-      {showAuth && <AuthModal onClose={() => setShowAuth(false)} />}
+      {showAuth && <AuthModal onClose={() => setShowAuth(false)} onSuccess={(u) => setUser(u)} />}
     </div>
   );
 }
